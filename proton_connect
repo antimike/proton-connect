@@ -1,0 +1,119 @@
+#!/usr/bin/expect -f
+# Expect script to automatically read VPN credentials from `pass` and enter them when prompted by `protonvpn-cli` and `nmcli`.
+
+proc connect {passwd} {
+    # setup nmcli secret agent to handle password request
+    # job numbers and PIDs need to be saved separately
+    set agent_pid [spawn nmcli agent all]
+    set agent_id $spawn_id
+    expect "nmcli successfully registered as a polkit agent."
+
+    # start protonvpn-cli process, which will send a password request to nmcli
+    set proton_pid [spawn protonvpn-cli connect -f]
+    set proton_id $spawn_id
+
+    # Switch back to polkit agent for password entry
+    set spawn_id $agent_id
+    expect {
+        "*assword*:*" {
+            send "$passwd\r"
+        }
+    }
+    # BUGGY: Expecting EOF hangs the proc until timeout is reached
+    # expect {
+    #     # Authentication failed
+    #     "A password is required." {
+    #         exec kill $agent_pid $proton_pid
+    #         return 1
+    #     }
+    #     eof {}
+    # }
+
+    # Finally, switch to proton process to listen for success or failure
+    set spawn_id $proton_id
+    expect {
+        "Successfully connected to Proton VPN." {
+            exec kill $agent_pid $proton_pid
+            return 0
+        }
+    }
+
+    # Timeout
+    exec kill $agent_pid $proton_pid
+    return 2
+}
+
+proc login {username passwd} {
+    set pid [spawn protonvpn-cli login $username]
+
+    expect {
+        "*assword:*" {
+            send "$passwd\r"
+            expect {
+                "Successful login." {
+                    return 0
+                }
+            }
+            # Login failed
+            exec kill $pid
+            return 1
+        }
+        "You are already logged in." {
+            return 0
+        }
+    }
+
+    # Timeout
+    exec kill $pid
+    return 2
+}
+
+proc print_errormsg {code} {
+    switch $code {
+        1 {
+            puts "Issue: failed to authenticate"
+        }
+        2 {
+            puts "Issue: timeout"
+        }
+    }
+}
+
+proc read_passfile {address dictname} {
+    # Indirection (local_dict is a reference to dictname)
+    upvar $dictname local_dict
+    set rawtext [exec pass show $address | sed "1s/^/password: /"]
+    foreach line [split $rawtext "\n"] {
+        set words [split [string map {":" {}} $line] " "]
+        if { [llength $words] == 2 } {
+            # dict set local_dict [lindex $words 0] [lindex $words 1]
+            eval dict set local_dict $words
+        }
+    }
+    return $local_dict
+}
+
+set timeout 30
+
+# Get credentials from from `pass`
+set proton_info [dict create]
+set network_info [dict create]
+read_passfile personal/proton proton_info 
+read_passfile wifi/vpn/proton network_info
+
+set login_result [login [dict get $proton_info username] [dict get $proton_info password]]
+if { $login_result != 0 } {  
+    puts "Login failed!"
+    print_errormsg $login_result
+    exit 1
+}
+puts "Login succeeded.  Connecting to VPN network..."
+
+set connect_result [connect [dict get $network_info password]]
+if { $connect_result != 0 } {
+    puts "Failed to connect to VPN network!"
+    print_errormsg $connect_result
+    exit 2
+}
+puts "VPN connection succeeded."
+exit 0
